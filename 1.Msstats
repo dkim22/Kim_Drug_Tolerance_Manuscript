@@ -1,0 +1,27 @@
+##Load library
+
+library(MSstats)
+library(MSstatsTMT)
+library(tidyverse)
+
+#Import raw data and meta data 
+data_dir <- "C:/Users/kdh92/Desktop/Proteomics_EK/Raw/"
+data_dirs <- list.dirs(path = "C:/Users/kdh92/Desktop/Proteomics_EK/Raw/", recursive = FALSE)
+out_dir <- "C:/Users/kdh92/Desktop/Proteomics_EK/Results/rds/"
+
+all_cell_msstats <- lapply(basename(data_dirs), function(x) {
+  cat(x, "\n\n")
+  data_evi<-read.delim(file.path(data_dir, x, "evidence.txt"), sep = "\t")
+  prot_group<-read.delim(file.path(data_dir, x, "proteinGroups.txt"), sep = "\t")
+  key<-read.csv(file.path(data_dir, x, "DK_keys.csv"),stringsAsFactors=F)
+  data_evi <- data_evi[!is.na(data_evi$Intensity),]
+  MaxQtoMSstatsTMTFormat(
+    data_evi,
+    prot_group,
+    key)
+})
+
+all_cell_msstats <- do.call(rbind, all_cell_msstats)
+
+saveRDS(all_cell_msstats, file = file.path(out_dir, "all_cell_msstats.rds"))
+
