@@ -46,3 +46,15 @@ nquant_msstats_H1975 <- proteinSummarization(
   reference_norm=TRUE,
   remove_norm_channel = T,
   remove_empty_channel = T)
+
+### Calculate the significances and log fold change across concentrations
+comparisons<-matrix(c(-1,1,0, -1, 0, 1, 0, -1, 1 ), byrow = TRUE, nrow=3)
+# Set the names of each row
+row.names(comparisons)<-c("d2-DMSO", "d9-DMSO", "d9-d2")
+colnames(comparisons)<-  levels(nquant_msstats$ProteinLevelData$Condition)
+
+compare_msstats <- groupComparisonTMT(data = nquant_msstats, 
+                                 contrast.matrix = comparisons, 
+                                 moderated = TRUE, use_log_file = FALSE )
+
+#saveRDS(compare_msstats, file = file.path(out_dir, "groupComparisonTMT.rds"))
