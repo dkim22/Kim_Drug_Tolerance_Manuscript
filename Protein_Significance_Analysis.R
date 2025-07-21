@@ -1,0 +1,60 @@
+### Reference: https://msstats.org/msstatstmt/
+### Load library
+
+library(MSstats)
+library(MSstatsTMT)
+library(tidyverse)
+
+### Import raw data and meta data 
+data_dir <- "E:/Proteomics_EK/Raw/"
+data_dirs <- list.dirs(path = "E:/Proteomics_EK/Raw/", recursive = FALSE)
+out_dir <- "E:/Proteomics_EK/Results/rds/"
+
+### Generate MSstatsTMT required input format from MaxQuant output 
+all_cell_msstats <- lapply(basename(data_dirs), function(x) {
+  cat(x, "\n\n")
+  data_evi<-read.delim(file.path(data_dir, x, "evidence.txt"), sep = "\t")
+  prot_group<-read.delim(file.path(data_dir, x, "proteinGroups.txt"), sep = "\t")
+  key<-read.csv(file.path(data_dir, x, "DK_keys.csv"),stringsAsFactors=F)
+  data_evi <- data_evi[!is.na(data_evi$Intensity),]
+  MaxQtoMSstatsTMTFormat(
+    data_evi,
+    prot_group,
+    key)
+})
+
+### Combine genearted input as a single file
+all_cell_msstats <- do.call(rbind, all_cell_msstats)
+#saveRDS(all_cell_msstats, file = file.path(out_dir, "all_cell_msstats.rds"))
+
+### Perform Protein Normalization by treatment condition regardless of cell line
+nquant_msstats <- proteinSummarization(
+  all_cell_msstats,
+  method="msstats",
+  global_norm=TRUE,
+  reference_norm=TRUE,
+  remove_norm_channel = T,
+  remove_empty_channel = T)
+#saveRDS(nquant_msstats, file = file.path(out_dir, "normalized_all_cell_msstats.rds"))
+
+### Protein normalization for each cell line is performed in same way 
+### H1975 data are assigned as Mixture 1 
+nquant_msstats_H1975 <- proteinSummarization(
+  filter(all_cell_msstats, Mixture == "Mixture 1"),
+  method="msstats",
+  global_norm=TRUE,
+  reference_norm=TRUE,
+  remove_norm_channel = T,
+  remove_empty_channel = T)
+
+### Calculate the significances and log fold change across concentrations
+comparisons<-matrix(c(-1,1,0, -1, 0, 1, 0, -1, 1 ), byrow = TRUE, nrow=3)
+# Set the names of each row
+row.names(comparisons)<-c("d2-DMSO", "d9-DMSO", "d9-d2")
+colnames(comparisons)<-  levels(nquant_msstats$ProteinLevelData$Condition)
+
+compare_msstats <- groupComparisonTMT(data = nquant_msstats, 
+                                      contrast.matrix = comparisons, 
+                                      moderated = TRUE, use_log_file = FALSE )
+
+#saveRDS(compare_msstats, file = file.path(out_dir, "groupComparisonTMT.rds"))
