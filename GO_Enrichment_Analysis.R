@@ -235,26 +235,6 @@ build_gene2go <- function(symbols, ontology = "BP") {
 }
 
 # ============================================================
-# UTILITY: run one topGO analysis for a given direction & ontology
-# ============================================================
-
-.run_topgo <- function(gene_universe, sig_genes, gene2go, ontology) {
-  all_genes <- factor(as.integer(gene_universe %in% sig_genes))
-  names(all_genes) <- gene_universe
-
-  go_data <- new(
-    "topGOdata",
-    ontology   = ontology,
-    allGenes   = all_genes,
-    geneSel    = function(x) x == 1,
-    annot      = annFUN.gene2GO,
-    gene2GO    = gene2go
-  )
-
-  runTest(go_data, algorithm = "weight01", statistic = "fisher")
-}
-
-# ============================================================
 # UTILITY: parse GenTable into a clean tibble
 # ============================================================
 
