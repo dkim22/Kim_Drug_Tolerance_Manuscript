@@ -43,24 +43,32 @@ get_root_id <- function(ontology = c("BP", "MF", "CC")) {
   )
 }
 
-#' Return all ancestor GO IDs for a set of GO IDs
-#' @param ids Character vector of GO IDs
+#' Return all ancestor GO IDs for a set of GO IDs (BFS, bounded depth)
+#' @param ids       Character vector of GO IDs (seeds)
 #' @param parent_map Named list returned by get_parent_map()
-get_ancestors <- function(ids, parent_map) {
+#' @param max_depth  Maximum number of hops above the seeds to traverse.
+#'   Default Inf (unlimited) keeps all existing call-sites compatible.
+get_ancestors <- function(ids, parent_map, max_depth = Inf) {
   visited <- character(0)
-  queue   <- ids
+  # Queue entries are two-element lists: list(id = <string>, depth = <int>)
+  queue   <- lapply(ids, function(x) list(id = x, depth = 0L))
 
   while (length(queue) > 0) {
-    current <- queue[1]
+    entry   <- queue[[1]]
     queue   <- queue[-1]
+    current <- entry$id
+    depth   <- entry$depth
 
     if (current %in% visited) next
     visited <- c(visited, current)
 
+    if (depth >= max_depth) next   # do not enqueue parents beyond the limit
+
     parents <- parent_map[[current]]
     parents <- parents[!is.na(parents) & parents != "all"]
     if (length(parents) > 0) {
-      queue <- c(queue, parents)
+      new_entries <- lapply(parents, function(p) list(id = p, depth = depth + 1L))
+      queue <- c(queue, new_entries)
     }
   }
 
@@ -68,129 +76,184 @@ get_ancestors <- function(ids, parent_map) {
 }
 
 #' Build an igraph subgraph for a set of GO IDs plus their ancestors
-#' @param go_ids Character vector of GO IDs to include
-#' @param ontology One of "BP", "MF", "CC"
-#' @param selected_df Optional data.frame with columns GO.ID and weight01Fisher
-#'   used to annotate nodes with enrichment data
-build_go_subgraph <- function(go_ids, ontology = "BP", selected_df = NULL) {
+#' @param go_ids            Character vector of GO IDs to include
+#' @param ontology          One of "BP", "MF", "CC"
+#' @param selected_df       Optional data.frame with columns GO.ID, weight01Fisher,
+#'   neg_log10_p, Annotated, Significant used to annotate nodes
+#' @param max_ancestor_depth Maximum BFS hops above seed terms to traverse.
+#'   Limits graph size by preventing deep traversal toward the ontology root.
+build_go_subgraph <- function(go_ids, ontology = "BP", selected_df = NULL,
+                               max_ancestor_depth = 4L) {
   parent_map <- get_parent_map(ontology)
-  root_id    <- get_root_id(ontology)
 
-  # Collect ancestors so the hierarchy is connected
-  ancestors  <- get_ancestors(go_ids, parent_map)
+  # Collect ancestors (bounded depth) so the hierarchy is connected
+  ancestors  <- get_ancestors(go_ids, parent_map, max_depth = max_ancestor_depth)
   all_ids    <- unique(c(go_ids, ancestors))
 
-  # Build edge list: child -> parent
+  # Build edge list: parent -> child  (corrected direction)
   edges <- lapply(all_ids, function(id) {
     parents <- parent_map[[id]]
     parents <- parents[!is.na(parents) & parents != "all"]
     parents <- intersect(parents, all_ids)   # keep only nodes already in the set
     if (length(parents) == 0) return(NULL)
-    data.frame(from = id, to = parents, stringsAsFactors = FALSE)
+    data.frame(from = parents, to = id, stringsAsFactors = FALSE)
   })
   edges <- do.call(rbind, Filter(Negate(is.null), edges))
 
   if (is.null(edges) || nrow(edges) == 0) {
-    # Return a minimal graph with just the seed nodes
     g <- make_empty_graph(n = length(go_ids), directed = TRUE)
-    V(g)$name      <- go_ids
-    V(g)$selected  <- TRUE
+    V(g)$name        <- go_ids
+    V(g)$selected    <- TRUE
     V(g)$neg_log10_p <- NA_real_
+    V(g)$annotated   <- NA_integer_
+    V(g)$significant <- NA_integer_
+    V(g)$depth       <- 0L
     return(g)
   }
 
-  g <- graph_from_data_frame(edges, directed = TRUE)
-
-  # Node metadata
-  term_names <- tryCatch(
-    AnnotationDbi::select(GO.db, keys = V(g)$name,
-                          columns = "TERM", keytype = "GOID")$TERM,
-    error = function(e) rep(NA_character_, vcount(g))
+  # Pin vertex creation order via the `vertices` argument
+  g <- graph_from_data_frame(
+    edges,
+    directed = TRUE,
+    vertices = data.frame(name = all_ids, stringsAsFactors = FALSE)
   )
-  V(g)$term     <- term_names
+
+  # Node metadata — use match() to guard against row-reorder from select()
+  go_terms_df <- tryCatch(
+    AnnotationDbi::select(GO.db, keys = V(g)$name,
+                          columns = "TERM", keytype = "GOID"),
+    error = function(e) data.frame(GOID = V(g)$name, TERM = NA_character_,
+                                   stringsAsFactors = FALSE)
+  )
+  term_idx      <- match(V(g)$name, go_terms_df$GOID)
+  V(g)$term     <- go_terms_df$TERM[term_idx]
   V(g)$selected <- V(g)$name %in% go_ids
+
+  # Enrichment data (only for seed/selected nodes)
   V(g)$neg_log10_p <- NA_real_
+  V(g)$annotated   <- NA_integer_
+  V(g)$significant <- NA_integer_
 
   if (!is.null(selected_df) && nrow(selected_df) > 0) {
     idx <- match(V(g)$name, selected_df$GO.ID)
     V(g)$neg_log10_p <- selected_df$neg_log10_p[idx]
+    if ("Annotated"   %in% colnames(selected_df))
+      V(g)$annotated   <- as.integer(selected_df$Annotated[idx])
+    if ("Significant" %in% colnames(selected_df))
+      V(g)$significant <- as.integer(selected_df$Significant[idx])
   }
+
+  # Compute BFS depth from root(s) (in-degree == 0 after parent→child edges)
+  roots <- which(degree(g, mode = "in") == 0)
+  if (length(roots) == 0) roots <- 1L
+  dist_mat  <- distances(g, v = roots, mode = "out")
+  # For each node take the minimum distance from any root
+  min_dists <- apply(dist_mat, 2, min)
+  min_dists[!is.finite(min_dists)] <- 0L
+  V(g)$depth <- as.integer(min_dists)
 
   g
 }
 
-#' ggraph plot highlighting top-N enriched GO terms by -log10(p)
-#' @param g igraph object returned by build_go_subgraph()
-#' @param title Plot title string
-#' @param top_n Number of top terms to label/highlight
-#' @param depth_palette Named colour palette (passed to scale_fill_manual)
-plot_focus_graph_top5 <- function(g, title = "", top_n = 5,
-                                  depth_palette = c(
-                                    "selected"   = "#E63946",
-                                    "ancestor"   = "#457B9D",
-                                    "background" = "#A8DADC"
-                                  )) {
+#' ggraph hierarchy plot with depth-pinned y-axis and enrichment-aware encoding
+#'
+#' Produces a DAG with the GO root at the top (y = 0) and enriched leaf terms
+#' at the bottom, matching the AEGIS / Reimand-2019 visual style:
+#'   - Colour: continuous -log10(p) gradient (grey -> yellow -> orange -> red)
+#'   - Size  : proportional to log1p(Annotated) for enriched nodes
+#'   - Labels: top-N enriched terms (wrapped term name + p-value)
+#'   - Arrows: downward, parent -> child
+#'
+#' @param g      igraph object returned by build_go_subgraph()
+#' @param title  Plot title string
+#' @param top_n  Number of top terms to label
+plot_go_hierarchy <- function(g, title = "", top_n = 5) {
   if (vcount(g) == 0) {
     return(ggplot() +
              labs(title = title, subtitle = "No nodes to display") +
              theme_void())
   }
 
-  # Assign node role
-  V(g)$role <- ifelse(V(g)$selected, "selected", "ancestor")
+  # --- Node size: log1p(Annotated) for enriched; fixed small for ancestors ---
+  node_sizes <- ifelse(
+    V(g)$selected & !is.na(V(g)$annotated),
+    log1p(V(g)$annotated) + 2,
+    2
+  )
+  V(g)$node_size <- node_sizes
 
-  # Identify top-N nodes by -log10(p) to label
+  # --- Identify top-N nodes to label (by neg_log10_p) ---
   top_ids <- character(0)
   if (any(!is.na(V(g)$neg_log10_p))) {
-    top_ids <- V(g)$name[order(V(g)$neg_log10_p, decreasing = TRUE,
-                               na.last = TRUE)][seq_len(min(top_n, vcount(g)))]
+    top_ids <- V(g)$name[
+      order(V(g)$neg_log10_p, decreasing = TRUE, na.last = TRUE)
+    ][seq_len(min(top_n, sum(!is.na(V(g)$neg_log10_p))))]
   }
 
-  V(g)$label <- ifelse(
-    V(g)$name %in% top_ids,
-    paste0(V(g)$name, "\n",
-           str_trunc(ifelse(is.na(V(g)$term), "", V(g)$term), 30)),
-    ""
-  )
+  # Safe loop-based label assignment (avoids ifelse NA-propagation)
+  labels <- character(vcount(g))
+  for (i in seq_len(vcount(g))) {
+    if (V(g)$name[i] %in% top_ids) {
+      term_txt  <- if (is.na(V(g)$term[i])) "" else str_wrap(V(g)$term[i], 22)
+      p_val     <- V(g)$neg_log10_p[i]
+      p_txt     <- if (is.na(p_val)) "" else sprintf("(p=%.1e)", 10^(-p_val))
+      labels[i] <- paste0(term_txt, "\n", p_txt)
+    }
+  }
+  V(g)$label <- labels
 
-  # Choose layout; fall back to kk if sugiyama fails
+  # --- Sugiyama layout for x-ordering; override y with -depth ---
   lay <- tryCatch(
     create_layout(g, layout = "sugiyama"),
     error = function(e) create_layout(g, layout = "kk")
   )
+  if ("depth" %in% vertex_attr_names(g)) {
+    lay$y <- -V(g)$depth   # root at y = 0; deeper nodes at more negative y
+  }
 
   ggraph(lay) +
     geom_edge_link(
-      aes(alpha = after_stat(index)),
-      colour  = "grey60",
-      arrow   = arrow(length = unit(2, "mm"), type = "closed"),
-      end_cap = circle(3, "mm"),
-      show.legend = FALSE
+      colour  = "grey55",
+      arrow   = arrow(length = unit(2.5, "mm"), type = "closed"),
+      end_cap = circle(4, "mm"),
+      alpha   = 0.55
     ) +
     geom_node_point(
-      aes(fill = role,
-          size = ifelse(is.na(neg_log10_p), 3, neg_log10_p + 3)),
-      shape = 21, colour = "white", alpha = 0.85
+      aes(fill = neg_log10_p, size = node_size),
+      shape  = 21,
+      colour = "white",
+      alpha  = 0.9
     ) +
     geom_node_text(
       aes(label = label),
-      size    = 2.5,
-      repel   = TRUE,
-      max.overlaps = 20,
-      colour  = "black"
+      size         = 2.4,
+      repel        = TRUE,
+      max.overlaps = 25,
+      colour       = "black",
+      lineheight   = 0.9
     ) +
-    scale_fill_manual(values  = depth_palette,
-                      name    = "Node type",
-                      breaks  = c("selected", "ancestor"),
-                      labels  = c("Enriched term", "Ancestor")) +
-    scale_size_continuous(range = c(2, 8), guide = "none") +
-    scale_edge_alpha(range = c(0.2, 0.6)) +
-    labs(title = title, subtitle = paste0("Top ", top_n, " terms highlighted")) +
+    scale_fill_gradientn(
+      colours  = c("#CCCCCC", "#FFFFB2", "#FD8D3C", "#BD0026"),
+      na.value = "#D9D9D9",
+      name     = expression(-log[10](p)),
+      guide    = guide_colourbar(barwidth = 8, barheight = 0.5,
+                                 title.position = "top")
+    ) +
+    scale_size_continuous(range = c(2, 10), guide = "none") +
+    labs(
+      title    = title,
+      subtitle = paste0(
+        "Top ", top_n, " terms labelled  |  ",
+        "Colour: -log\u2081\u2080(p)  |  Size \u221d log(Annotated + 1)"
+      )
+    ) +
     theme_void() +
     theme(
-      plot.title    = element_text(face = "bold", size = 13, hjust = 0.5),
-      plot.subtitle = element_text(size = 10, hjust = 0.5, colour = "grey40"),
-      legend.position = "bottom"
+      plot.title       = element_text(face = "bold", size = 13, hjust = 0.5),
+      plot.subtitle    = element_text(size = 9,  hjust = 0.5, colour = "grey40"),
+      legend.position  = "bottom",
+      legend.title     = element_text(size = 9),
+      legend.text      = element_text(size = 8)
     )
 }
 
@@ -403,7 +466,7 @@ run_go_enrichment <- function(df_go,
                                    paste0("log2FC <= -", lfc_cutoff)))
 
       p <- tryCatch(
-        plot_focus_graph_top5(g, title = plot_title, top_n = 5),
+        plot_go_hierarchy(g, title = plot_title, top_n = 5),
         error = function(e) {
           cat(sprintf("  [%s %s] plot error: %s\n", ont, direction, e$message))
           NULL
@@ -418,7 +481,7 @@ run_go_enrichment <- function(df_go,
       png_path <- file.path(output_dir,
                             sprintf("GO_%s_%s_hierarchy.png", ont, direction))
       tryCatch(
-        ggsave(png_path, p, width = 14, height = 10, dpi = 300),
+        ggsave(png_path, p, width = 14, height = 12, dpi = 300),
         error = function(e)
           cat(sprintf("  [%s %s] ggsave error: %s\n", ont, direction, e$message))
       )
