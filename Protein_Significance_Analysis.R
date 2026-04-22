@@ -48,6 +48,7 @@ nquant_msstats_H1975 <- proteinSummarization(
   remove_empty_channel = T)
 
 ### Calculate the significances and log fold change across concentrations
+### Can be calculated for each cell line and combined nquant as well to calculate global change
 comparisons<-matrix(c(-1,1,0, -1, 0, 1, 0, -1, 1 ), byrow = TRUE, nrow=3)
 # Set the names of each row
 row.names(comparisons)<-c("d2-DMSO", "d9-DMSO", "d9-d2")
